@@ -1,5 +1,5 @@
 # External Display for WAHOO KICKR BIKE SHIFT
-Code is written for LILYGO T-Display-S3 ESP32-S3 or LILYGO TTGO T-Display ESP32 and displays the following Bluetooth Low Energy (BLE) data:
+Code is written for LILYGO T-Display-S3 ESP32-S3, LILYGO TTGO T-Display ESP32, or Waveshare ESP32-S3-Touch-LCD-1.47 (see [below](#waveshare-esp32-s3-touch-lcd-147)) and displays the following Bluetooth Low Energy (BLE) data:
 
 - Gearing ratio (as set in the wahoo app) and what gears you are currently in. Information (text and graphic) will update when shifting.
 - Cycling power (watts and watts per kilogram). Displayed information can be changed (instantaneous power, 3s moving average, 10s moving average) via a button (BOOT) on the device.
@@ -25,6 +25,61 @@ Comment and un-comment the following lines in the "..\libraries\TFT_eSPI\User_Se
 >
 > #include <User_Setups/Setup206_LilyGo_T_Display_S3.h>
 
+### Waveshare ESP32-S3-Touch-LCD-1.47
+
+This board is **not** the same as the non-touch `ESP32-S3-LCD-1.47` — different
+LCD controller, different pin map. Do not mix up their setup files.
+
+| | |
+|---|---|
+| MCU | ESP32-S3R8, 16MB flash, 8MB octal PSRAM |
+| LCD | **JD9853**, 172x320 IPS, SPI. Column offset 34, row offset 0 |
+| LCD pins | SCK 38, MOSI 39, DC 45, CS 21, RST 40, backlight 46 (active HIGH) |
+| Touch | AXS5106L on I2C — SCL 41, SDA 42, RST 47, IRQ 48 (unused by this sketch) |
+| SD | CMD 15, CLK 16, D0 17, D1 18, D2 13, D3 14 |
+
+Note that GPIO47 is the *touch* reset, not the panel reset — some third-party
+pinouts get this wrong.
+
+Instead of the two `User_Setup_Select.h` lines above, use the setup file
+included in this repo:
+
+1. Copy `Setup901_Waveshare_S3_Touch_LCD_147.h` into
+   `..\libraries\TFT_eSPI\User_Setups\`
+2. In `..\libraries\TFT_eSPI\User_Setup_Select.h`, comment out the LilyGO /
+   TTGO includes and add, **next to the other setup includes** (the driver
+   dispatch further down the file runs before the end of it, so an include
+   appended at the bottom is too late):
+
+> #include <User_Setups/Setup901_Waveshare_S3_Touch_LCD_147.h>
+
+There is no Arduino board variant for this board. Build it with the
+**LilyGo T-Display-S3** board selection (`esp32:esp32:lilygo_t_display_s3`) —
+same chip, flash and PSRAM configuration, and USB CDC serial works.
+
+#### Two things worth knowing
+
+**TFT_eSPI needs `USE_HSPI_PORT` on the ESP32-S3.** It is already in the
+included setup file. TFT_eSPI 2.5.43 overloads `SPI_PORT` for two incompatible
+numbering schemes: the `SPIClass` bus index (on S3 the core defines `FSPI 0`,
+`HSPI 1`) and the raw register macros `SPI_CMD_REG(n)`, where
+`REG_SPI_BASE(i)` is `((i)>=2) ? (DR_REG_SPI2_BASE + (i-2)*0x1000) : 0`. The S3
+default of `SPI_PORT = FSPI` is therefore 0, `REG_SPI_BASE(0)` returns 0, and
+every register write lands near address 0:
+
+> Guru Meditation Error: Core 1 panic'ed (StoreProhibited), EXCVADDR: 0x00000010
+
+with a backtrace through `begin_tft_write` -> `TFT_eSPI::init` -> `begin`.
+`USE_HSPI_PORT` makes both meanings resolve to SPI3. Fixed in TFT_eSPI master,
+so this workaround can go once a release ships with it.
+
+**TFT_eSPI has no JD9853 driver, and does not need one.** The drawing path is
+standard MIPI-DCS and identical to the ST7789, so the setup file selects
+`ST7789_DRIVER` with `CGRAM_OFFSET` and the sketch pushes the vendor
+initialisation sequence itself in `jd9853Init()`, called right after
+`tft.begin()`. That sequence and the pin map above come from the CircuitPython
+board port, [adafruit/circuitpython#10689](https://github.com/adafruit/circuitpython/pull/10689).
+
 ## A few things to consider
 
 1. If you have changed the Bluetooth name of your bike (in the wahoo app) you will need to change it also in the code:
@@ -33,7 +88,7 @@ Comment and un-comment the following lines in the "..\libraries\TFT_eSPI\User_Se
 > 
 > #define bleServerName "KICKR BIKE SHIFT 720C"
 
-2. Set Display Resolution "170 x 320" for LILYGO T-Display-S3 ESP32-S3 or "135 x 240" for LILYGO TTGO T-Display ESP32
+2. Set Display Resolution "170 x 320" for LILYGO T-Display-S3 ESP32-S3, "172 x 320" for Waveshare ESP32-S3-Touch-LCD-1.47, or "135 x 240" for LILYGO TTGO T-Display ESP32
    
 > #define RESOLUTION_X 320
 > 

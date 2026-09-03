@@ -116,6 +116,11 @@ static BLEUUID charUUID41("00002a37-0000-1000-8000-00805f9b34fb");
 
 // Flags stating if should begin connecting and if the connection is up
 static boolean doConnect = false;
+// Set when the link drops so loop() can restart scanning. The bike powers
+// itself down when idle, so without this the board sits disconnected forever
+// and only a reset brings it back.
+static volatile boolean doScan = false;
+static BLEClient *pClient = nullptr;
 static boolean connected = false;
 
 // Address of the peripheral device. Address will be found during scanning...
@@ -169,6 +174,7 @@ class MyClientCallback : public BLEClientCallbacks {
 
   void onDisconnect(BLEClient *pClient) {
     connected = false;
+    doScan = true;
     DisplayText("We are disconnected: " + String(pClient->getPeerAddress().toString().c_str()));
   }
 };
@@ -178,11 +184,13 @@ bool connectToServer(BLEAddress pAddress) {
   String myDisplay = "Forming a connection to " + String(pAddress.toString().c_str());
   DisplayText(myDisplay);
 
-  BLEClient *pClient = BLEDevice::createClient();
-  DisplayText("We have created the Client");
-
-  // Status
-  pClient->setClientCallbacks(new MyClientCallback());
+  // Created once and reused: a fresh client (and callback object) per reconnect
+  // leaks, and the bike disconnects every time it powers down.
+  if (pClient == nullptr) {
+    pClient = BLEDevice::createClient();
+    pClient->setClientCallbacks(new MyClientCallback());
+    DisplayText("We have created the Client");
+  }
   
   // pClient->setConnectionParams(...,...,...,...);
   // Set how long we are willing to wait for the connection to complete (seconds), default is 30. */
@@ -326,8 +334,7 @@ bool connectCharacteristic3(BLERemoteService *pRemoteService, BLERemoteCharacter
 // Callback function that gets called, when another device's advertisement has been received
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice advertisedDevice) {
-    String myDisplay = "BLE Advertised Device found: " + String(advertisedDevice.toString().c_str());
-    DisplayText(myDisplay);
+    Serial.println("BLE Advertised Device found: " + String(advertisedDevice.toString().c_str()));
 
     if (advertisedDevice.getName() == bleServerName) { 
       // Check if the name of the advertiser matches
@@ -335,6 +342,7 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
       // stop scan before connecting, we found what we are looking for
       advertisedDevice.getScan()->stop();      
       // Save the device reference (address of advertiser) in a global for the client to use
+      if (pServerAddress != nullptr) delete pServerAddress;
       pServerAddress = new BLEAddress(advertisedDevice.getAddress());
       // Set indicator, stating that we are ready to connect
       doConnect = true;                                              
@@ -783,6 +791,13 @@ static void updateDisplayPower() {
 
 void loop() {
   updateDisplayPower();
+
+  // Restart scanning after a drop. Duration 0 scans until onResult() stops it,
+  // so the board waits however long the bike stays off.
+  if (doScan && !doConnect && !connected) {
+    doScan = false;
+    BLEDevice::getScan()->start(0);
+  }
   // If the flag "doConnect" is true then we have scanned for and found the desired
   // BLE Server with which we wish to connect.  Now we connect to it.  Once we are
   // connected we set the connected flag to be true.
@@ -796,7 +811,8 @@ void loop() {
       repaintGearing();
       lastDataMillis = millis();
     } else {
-      DisplayText("Failed to connect - Restart to scan");
+      DisplayText("Failed to connect - rescanning");
+      doScan = true;
     }
     doConnect = false;
   }
