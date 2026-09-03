@@ -18,7 +18,7 @@ TFT_eSprite sprPowerText = TFT_eSprite(&tft);
 // 320 x 170 ... LILYGO T-Display-S3 ESP32-S3
 // 240 x 135 ... LILYGO TTGO T-Display ESP32
 #define RESOLUTION_X 320
-#define RESOLUTION_Y 170
+#define RESOLUTION_Y 172
 
 // BUTTON BOOT
 #define BUTTON_PIN_BOOT 0
@@ -78,7 +78,7 @@ int AdvertisingIntervalOld = 0;
 int AdvertisingInterval = 0;
 
 // BLE Server name
-#define bleServerName "KICKR BIKE SHIFT 720C"
+#define bleServerName "KICKR BIKE SHIFT 3356"
 
 // Cadence
 // Crank Event Time
@@ -129,7 +129,18 @@ BLERemoteCharacteristic *pRemoteCharacteristic_2;
 // Weight Measurement
 BLERemoteCharacteristic *pRemoteCharacteristic_3;
 
+// TFT_eSPI is not thread-safe, and the panels are drawn from two FreeRTOS
+// tasks: power/cadence from loop(), gearing from the BLE notify callback.
+// Concurrent pushSprite() calls interleave on the SPI bus and corrupt the
+// display. One mutex, taken for the whole of each panel draw.
+static SemaphoreHandle_t tftMutex = xSemaphoreCreateMutex();
+struct TftLock {
+  TftLock()  { xSemaphoreTake(tftMutex, portMAX_DELAY); }
+  ~TftLock() { xSemaphoreGive(tftMutex); }
+};
+
 void DisplayText(String myDebug) {
+  TftLock lock;
   sprDebug.createSprite(RESOLUTION_X, RESOLUTION_Y);
   sprDebug.fillSprite(TFT_BLACK);
   // sprDebug.fillScreen(TFT_BLACK);
@@ -144,6 +155,8 @@ void DisplayText(String myDebug) {
   Serial.println(myDebug);
 
   sprDebug.pushSprite(0, 0);
+  sprDebug.unloadFont();
+  sprDebug.deleteSprite();
 }
 
 class MyClientCallback : public BLEClientCallbacks {
@@ -175,7 +188,7 @@ bool connectToServer(BLEAddress pAddress) {
   // Set how long we are willing to wait for the connection to complete (seconds), default is 30. */
   // pClient->setConnectTimeout(5);  
 
-  pClient->connect(pAddress, BLE_ADDR_TYPE_RANDOM);
+  pClient->connect(pAddress, BLE_ADDR_RANDOM);
 
   if(!pClient->isConnected()) {
     if (!pClient->connect(pAddress)) {
@@ -343,8 +356,57 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
 
 // Gearing
 // When the BLE Server sends a new value reading with the notify property
-int currentFrontGear = 0;
-int currentRearGear = 0;
+int currentFrontGear = -1;
+int currentRearGear = -1;
+// GearingGraph divides by the gear counts, and an integer divide-by-zero is a
+// panic-and-reboot on the ESP32 -- the bike does emit short/zeroed packets
+// while a shift is in progress, which rebooted the board mid-shift.
+static uint8_t lastGearing[8];
+static size_t  lastGearingLen = 0;
+
+// Blank the screen when the bike stops sending. The KICKR notifies power
+// continuously while it is awake (even at 0 W), so silence really does mean
+// "nobody is on the bike". Tune this if it sleeps too eagerly.
+#define DISPLAY_IDLE_MS (20UL * 60UL * 1000UL)
+static volatile unsigned long lastDataMillis = 0;
+static volatile unsigned long lastGearingChangeMillis = 0;
+static bool displayAwake = true;
+
+static void drawGearing(const uint8_t *pData, size_t length) {
+  if (length < 6) return;
+  if (pData[4] == 0 || pData[5] == 0) return;          // gear counts
+  if (pData[2] >= pData[4] || pData[3] >= pData[5]) return;  // selected out of range
+
+  if (pData != lastGearing) {
+    lastGearingLen = length < sizeof(lastGearing) ? length : sizeof(lastGearing);
+    memcpy(lastGearing, pData, lastGearingLen);
+  }
+
+  if (currentFrontGear != pData[2] || currentRearGear != pData[3]) {
+    lastGearingChangeMillis = millis();
+    GearingGraph(pData[4], pData[5], pData[2], pData[3]);
+    GearingText(pData[2], pData[3]);
+  }
+  currentFrontGear = pData[2];
+  currentRearGear = pData[3];
+}
+
+static void repaintGearing() {
+  currentFrontGear = -1;   // force a redraw of the gear we are already in
+  currentRearGear = -1;
+  if (lastGearingLen >= 6) {
+    drawGearing(lastGearing, lastGearingLen);
+    return;
+  }
+  if (pRemoteCharacteristic_1 != nullptr && pRemoteCharacteristic_1->canRead()) {
+    String v = pRemoteCharacteristic_1->readValue();
+    Serial.printf("Gearing read: %d bytes\n", v.length());
+    drawGearing((const uint8_t *)v.c_str(), v.length());
+  } else {
+    Serial.println("Gearing: no cached packet and characteristic not readable");
+  }
+}
+
 static void notifyGearing(BLERemoteCharacteristic *pBLERemoteCharacteristic, uint8_t *pData, size_t length, bool isNotify) {
   // Gears
   // 2 ... # Selected Gear in Front
@@ -355,13 +417,7 @@ static void notifyGearing(BLERemoteCharacteristic *pBLERemoteCharacteristic, uin
   // String strDebug = "Gearing:" + String(pData[4]) + ":" + String(pData[5]) + "\n" + "Selected Gears:" + String(pData[2]) + ":" + String(pData[3]);
   // DisplayText(strDebug);
 
-  if (currentFrontGear != pData[2] || currentRearGear != pData[3]) {
-    // Draw Graphics
-    GearingGraph(pData[4], pData[5], pData[2], pData[3]);
-    GearingText(pData[2], pData[3]);
-  }
-  currentFrontGear = pData[2];
-  currentRearGear = pData[3];
+  drawGearing(pData, length);
 
   /*
   // DEBUG
@@ -459,6 +515,8 @@ static void notifyCyclingPowerMeasurement(BLERemoteCharacteristic *pBLERemoteCha
   
   OldCrankEventTime = NewCrankEventTime;
   OldCrankRevolutions = NewCrankRevolutions;
+
+  if (intPower > 0 || Cadence > 0) lastDataMillis = millis();
 }
 
 /*
@@ -475,6 +533,63 @@ void IRAM_ATTR toggleButtonIO() {
 }
 */
 
+// This panel is a JD9853, not the ST7789 the setup header selects. The drawing
+// path is identical standard MIPI-DCS, so TFT_eSPI drives it fine once the
+// vendor init has run. Sequence from the CircuitPython board port
+// (adafruit/circuitpython#10689). Format: cmd, argc (|0x80 = trailing delay ms).
+static void jd9853Init() {
+  static const uint8_t seq[] PROGMEM = {
+    0x11, 0x80, 120,
+    0xDF, 2,  0x98, 0x53,
+    0xB2, 1,  0x23,
+    0xB7, 4,  0x00, 0x47, 0x00, 0x6F,
+    0xBB, 6,  0x1C, 0x1A, 0x55, 0x73, 0x63, 0xF0,
+    0xC0, 2,  0x44, 0xA4,
+    0xC1, 1,  0x16,
+    0xC3, 8,  0x7D, 0x07, 0x14, 0x06, 0xCF, 0x71, 0x72, 0x77,
+    0xC4, 12, 0x00, 0x00, 0xA0, 0x79, 0x0B, 0x0A, 0x16, 0x79, 0x0B, 0x0A, 0x16, 0x82,
+    0xC8, 32, 0x3F, 0x32, 0x29, 0x29, 0x27, 0x2B, 0x27, 0x28, 0x28, 0x26, 0x25, 0x17, 0x12, 0x0D, 0x04, 0x00,
+              0x3F, 0x32, 0x29, 0x29, 0x27, 0x2B, 0x27, 0x28, 0x28, 0x26, 0x25, 0x17, 0x12, 0x0D, 0x04, 0x00,
+    0xD0, 5,  0x04, 0x06, 0x6B, 0x0F, 0x00,
+    0xD7, 2,  0x00, 0x30,
+    0xE6, 1,  0x14,
+    0xDE, 1,  0x01,
+    0xB7, 5,  0x03, 0x13, 0xEF, 0x35, 0x35,
+    0xC1, 3,  0x14, 0x15, 0xC0,
+    0xC2, 2,  0x06, 0x3A,
+    0xC4, 2,  0x72, 0x12,
+    0xBE, 1,  0x00,
+    0xDE, 1,  0x02,
+    0xE5, 3,  0x00, 0x02, 0x00,
+    0xE5, 3,  0x01, 0x02, 0x00,
+    0xDE, 1,  0x00,
+    0x35, 1,  0x00,        // TEON
+    0x3A, 1,  0x05,        // COLMOD: 16bpp
+    0x2A, 4,  0x00, 0x22, 0x00, 0xCD,   // CASET 34..205 (172 wide)
+    0x2B, 4,  0x00, 0x00, 0x01, 0x3F,   // PASET 0..319
+    0xDE, 1,  0x02,
+    0xE5, 3,  0x00, 0x02, 0x00,
+    0xDE, 1,  0x00,
+    0x36, 1,  0x00,        // MADCTL: RGB order (setRotation rewrites this)
+    0x29, 0,               // DISPON
+  };
+
+  // tft.begin() already ran the ST7789 sequence into registers this chip reads
+  // differently; reset back to power-on defaults before loading the real one.
+  tft.writecommand(0x01);
+  delay(150);
+
+  const uint8_t *p = seq;
+  const uint8_t *end = seq + sizeof(seq);
+  while (p < end) {
+    uint8_t cmd = pgm_read_byte(p++);
+    uint8_t n   = pgm_read_byte(p++);
+    tft.writecommand(cmd);
+    for (uint8_t i = 0; i < (n & 0x7F); i++) tft.writedata(pgm_read_byte(p++));
+    if (n & 0x80) delay(pgm_read_byte(p++));
+  }
+}
+
 void setup() {
   // Bit per second (baud) for serial data transmission
   Serial.begin(250000);
@@ -482,6 +597,7 @@ void setup() {
   // Screen Setup
   // tft.init();
   tft.begin();
+  jd9853Init();       // TFT_eSPI ships no JD9853 driver; push the vendor sequence
   tft.setRotation(1);
   tft.fillScreen(TFT_MAGENTA);
 
@@ -508,11 +624,14 @@ void setup() {
   // pBLEScan->setWindow(449);  
   pBLEScan->setActiveScan(true);
   pBLEScan->start(30);
+
+  lastDataMillis = millis();
 }
 
 // Graphics ---------------------------------------------
 void GearingGraph(int myFrontGears, int myRearGears, int selectedFrontGear, int selectedRearGear)
 {
+  TftLock lock;
   // Size of Graph
   #define IWIDTH ((RESOLUTION_X/5)*3)
   #define IHEIGHT ((RESOLUTION_Y / 5)*3)
@@ -554,6 +673,7 @@ void GearingGraph(int myFrontGears, int myRearGears, int selectedFrontGear, int 
 }
 
 void GearingText(int selectedFrontGear, int selectedRearGear) {
+  TftLock lock;
   // Size of Graph
   #define IWIDTH (((RESOLUTION_X/5)*3)/2)
   #define IHEIGHT ((RESOLUTION_Y / 5)*2)
@@ -575,6 +695,7 @@ void GearingText(int selectedFrontGear, int selectedRearGear) {
 }
 
 void PowerText(String strPower) {
+  TftLock lock;
   // Size of Graph
   #define IWIDTH (((RESOLUTION_X/5)*3)/2)
   #define IHEIGHT ((RESOLUTION_Y / 5)*2)
@@ -596,6 +717,7 @@ void PowerText(String strPower) {
 }
 
 void PowerKgText(String strPower) {
+  TftLock lock;
   // Size of Graph
   #define IWIDTH ((RESOLUTION_X/5)*2)
   #define IHEIGHT (RESOLUTION_Y / 2)
@@ -618,6 +740,7 @@ void PowerKgText(String strPower) {
 
 void CadenceText(String strCadence)
 {
+  TftLock lock;
   // Size of Graph
   #define IWIDTH ((RESOLUTION_X/5)*2)
   #define IHEIGHT (RESOLUTION_Y / 2)
@@ -638,13 +761,40 @@ void CadenceText(String strCadence)
   sprCadenceText.deleteSprite();
 }
 
+// Backlight only: on this IPS panel that is the visible effect and nearly all
+// of the display power. If deeper sleep is ever needed, add JD9853 SLPIN (0x10)
+// here and re-run jd9853Init() on wake.
+static void updateDisplayPower() {
+  unsigned long quiet = min(millis() - lastDataMillis,
+                            millis() - lastGearingChangeMillis);
+  bool idle = quiet > DISPLAY_IDLE_MS;
+  if (idle == !displayAwake) return;          // already in the right state
+
+  displayAwake = !idle;
+  digitalWrite(TFT_BL, displayAwake ? TFT_BACKLIGHT_ON : !TFT_BACKLIGHT_ON);
+  if (displayAwake) {
+    // Panels only redraw when their value changes, so the gear tile would stay
+    // blank until the next shift without this.
+    { TftLock lock; tft.fillScreen(TFT_BLACK); }
+    repaintGearing();
+  }
+  Serial.println(displayAwake ? "Display awake" : "Display asleep (no data)");
+}
+
 void loop() {
+  updateDisplayPower();
   // If the flag "doConnect" is true then we have scanned for and found the desired
   // BLE Server with which we wish to connect.  Now we connect to it.  Once we are
   // connected we set the connected flag to be true.
   if (doConnect == true) {
     if (connectToServer(*pServerAddress)) {
       DisplayText("Connected to BLE Server");
+      // Status messages are drawn as a full-screen sprite, so clear it before
+      // the panels go up. Gearing only notifies on a shift, so seed it with a
+      // read -- drawGearing() drops the packet if the read gives us nothing.
+      tft.fillScreen(TFT_BLACK);
+      repaintGearing();
+      lastDataMillis = millis();
     } else {
       DisplayText("Failed to connect - Restart to scan");
     }
