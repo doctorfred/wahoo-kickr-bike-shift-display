@@ -331,6 +331,8 @@ bool connectCharacteristic3(BLERemoteService *pRemoteService, BLERemoteCharacter
   return true;
 }
 
+static void scanComplete(BLEScanResults results) {}
+
 // Callback function that gets called, when another device's advertisement has been received
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice advertisedDevice) {
@@ -631,7 +633,7 @@ void setup() {
   // Amount of time (duration) of the scan.
   // pBLEScan->setWindow(449);  
   pBLEScan->setActiveScan(true);
-  pBLEScan->start(30);
+  doScan = true;              // loop() starts it, non-blocking, and keeps retrying
 
   lastDataMillis = millis();
 }
@@ -793,10 +795,13 @@ void loop() {
   updateDisplayPower();
 
   // Restart scanning after a drop. Duration 0 scans until onResult() stops it,
-  // so the board waits however long the bike stays off.
+  // so the board waits however long the bike stays off. The callback overload
+  // is the non-blocking one -- start(0) on its own blocks the calling task
+  // until the scan ends, which would freeze loop() (and the idle-blank timer)
+  // for as long as the bike is away.
   if (doScan && !doConnect && !connected) {
     doScan = false;
-    BLEDevice::getScan()->start(0);
+    BLEDevice::getScan()->start(0, scanComplete, false);
   }
   // If the flag "doConnect" is true then we have scanned for and found the desired
   // BLE Server with which we wish to connect.  Now we connect to it.  Once we are
